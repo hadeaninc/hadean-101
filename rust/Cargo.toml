@@ -1,0 +1,20 @@
+[package]
+name = "hadean-101"
+version = "0.1.0"
+authors = ["Aidan Hobson Sayers <aidanhs@cantab.net>"]
+
+[[bin]]
+name = "ga"
+path = "ga.rs"
+
+[[bin]]
+name = "simple-send-recv"
+path = "simple-send-recv.rs"
+
+[dependencies]
+hadean = "0.2"
+hadean-std = "0.2"
+
+rand = "0.3"
+serde = "0.9"
+serde_derive = "0.9"

@@ -4,18 +4,21 @@
 extern crate hadean;
 extern crate hadean_std;
 extern crate rand;
+extern crate serde;
+#[macro_use]
+extern crate serde_derive;
 
-use hadean::{Sender, Receiver, Connection, ChannelEndpoint, Channel, ProcessSendable};
-use hadean::{spawn, pid};
-
+use hadean::{RawSender, RawReceiver, Sender, Receiver, Connection, ChannelEndpoint, Channel, ProcessTransfer};
+use hadean::{pid, spawn};
 use hadean_std::pinnedvec::PinnedVec;
-
-use rand::{Rng, SeedableRng};
+use rand::{SeedableRng, Rng};
 use rand::distributions::IndependentSample;
 
 use std::{cmp, mem, env};
 
-trait Phenotype {
+use self::Msg::*;
+
+pub trait Phenotype {
 	fn init(&mut self);
 	fn utility(&self) -> f64;
 	fn crossover(&mut self, other: &mut Self);
@@ -31,7 +34,8 @@ fn select(rng: &mut rand::XorShiftRng, utilities: &[f64]) -> usize {
 	i-1
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone,Copy)]
+#[derive(Serialize, Deserialize)]
 struct WorkerArgs {
 	index: usize,
 	num_workers: usize,
@@ -42,7 +46,21 @@ struct WorkerArgs {
 	crossover_count: usize,
 	migrate_count: usize
 }
-fn worker<T: Copy + Phenotype + ProcessSendable>(args: &WorkerArgs, senders: Vec<Sender>, receivers: Vec<Receiver>, _connections: Vec<Connection>) {
+#[derive(Serialize, Deserialize)]
+enum Msg<T: Phenotype + ProcessTransfer> {
+	Done(bool),
+	Phenotype(T),
+	Best(f64),
+}
+impl<T: Phenotype + ProcessTransfer> Msg<T> {
+	fn unwrap_done(self) -> bool { if let Done(b) = self { b } else { panic!("not a done msg (bool)") } }
+	fn unwrap_pheno(self) -> T { if let Phenotype(p) = self { p } else { panic!("not a phenotype") } }
+	fn unwrap_best(self) -> f64 { if let Best(f) = self { f } else { panic!("not a best msg (f64)") } }
+}
+fn worker<T: Copy + Phenotype + ProcessTransfer>(args: &WorkerArgs, senders: Vec<RawSender>, receivers: Vec<RawReceiver>, _connections: Vec<Connection>) {
+	let mut senders = senders.into_iter();
+	let mut receivers = receivers.into_iter();
+
 	let mut rng = rand::XorShiftRng::from_seed([1,2,3,4]);
 	let mut population: PinnedVec<T> = PinnedVec::with_capacity(args.population_count);
 	unsafe { population.set_len(args.population_count) };
@@ -52,11 +70,11 @@ fn worker<T: Copy + Phenotype + ProcessSendable>(args: &WorkerArgs, senders: Vec
 		population[i].init();
 	}
 
-	let from_left = &receivers[0];
-	let to_right = &senders[0];
+	let from_left: Receiver<Msg<T>> = receivers.next().unwrap().downcast();
+	let to_right: Sender<Msg<T>> = senders.next().unwrap().downcast();
 
 	let mut best: f64;
-	let mut winner = unsafe{mem::uninitialized()};
+	let mut winner = population[0];
 
 	let mut generation = 0;
 	loop {
@@ -75,17 +93,16 @@ fn worker<T: Copy + Phenotype + ProcessSendable>(args: &WorkerArgs, senders: Vec
 		println!("{:?}: gen {}: {}/{}", pid(), generation, best, args.phenotype_goal);
 
 		if args.index == 0 {
-			to_right.send(&done);
-			from_left.receive::<bool>(&mut done);
-			to_right.send(&done);
-			from_left.receive::<bool>(&mut done);
+			to_right.send(&Done(done));
+			done = from_left.recv().unwrap_done();
+			to_right.send(&Done(done));
+			done = from_left.recv().unwrap_done();
 		} else {
-			let mut done2 = unsafe{ mem::uninitialized() };
-			from_left.receive::<bool>(&mut done2);
+			let done2 = from_left.recv().unwrap_done();
 			done |= done2;
-			to_right.send(&done);
-			from_left.receive::<bool>(&mut done);
-			to_right.send(&done);
+			to_right.send(&Done(done));
+			done = from_left.recv().unwrap_done();
+			to_right.send(&Done(done));
 		}
 
 		if done || generation == args.generations_max {
@@ -97,21 +114,21 @@ fn worker<T: Copy + Phenotype + ProcessSendable>(args: &WorkerArgs, senders: Vec
 			for _ in 0..args.migrate_count {
 				let k = rng.gen_range(0, args.population_count);
 				migrating.push(k).unwrap();
-				to_right.send(&population[k]);
+				to_right.send(&Phenotype(population[k]));
 			}
 			for j in 0..args.migrate_count {
 				let k = migrating[j];
-				from_left.receive(&mut population[k]);
+				population[k] = from_left.recv().unwrap_pheno();
 			}
 		} else {
 			let mut migrating_phenotypes = PinnedVec::with_capacity(args.migrate_count);
 			for _ in 0..args.migrate_count {
 				let k = rng.gen_range(0, args.population_count);
 				migrating_phenotypes.push(population[k]).unwrap();
-				from_left.receive(&mut population[k]);
+				population[k] = from_left.recv().unwrap_pheno();
 			}
 			for j in 0..args.migrate_count {
-				to_right.send(&migrating_phenotypes[j]);
+				to_right.send(&Phenotype(migrating_phenotypes[j]));
 			}
 		}
 
@@ -148,26 +165,24 @@ fn worker<T: Copy + Phenotype + ProcessSendable>(args: &WorkerArgs, senders: Vec
 	println!("{:?}: done: {}/{}", pid(), best, args.phenotype_goal);
 
 	if args.index != 0 {
-		let mut left_best: f64 = unsafe{mem::uninitialized()};
-		let mut left_winner: T = unsafe{mem::uninitialized()};
-		from_left.receive(&mut left_best);
-		from_left.receive(&mut left_winner);
+		let left_best = from_left.recv().unwrap_best();
+		let left_winner = from_left.recv().unwrap_pheno();
 		if left_best > best {
 			best = left_best;
 			winner = left_winner;
 		}
 	}
 	if args.index != args.num_workers-1 {
-		to_right.send(&best);
-		to_right.send(&winner);
+		to_right.send(&Best(best));
+		to_right.send(&Phenotype(winner));
 	}
 	if args.index == args.num_workers-1 {
-		let parent_channel = &senders[1];
+		let parent_channel: Sender<T> = senders.next().unwrap().downcast();
 		parent_channel.send(&winner);
 	}
 }
 
-fn run<T: Copy + Phenotype + ProcessSendable>(num_workers: usize, phenotype_goal: f64, population_count: usize, generations_max: usize, mutate_count: usize, crossover_count: usize, migrate_count: usize) -> T {
+pub fn run<T: Copy + Phenotype + ProcessTransfer>(num_workers: usize, phenotype_goal: f64, population_count: usize, generations_max: usize, mutate_count: usize, crossover_count: usize, migrate_count: usize) -> T {
 	println!("running genetic algorithm across {} subpopulations", num_workers);
 
 	let mut processes = Vec::new();
@@ -186,12 +201,12 @@ fn run<T: Copy + Phenotype + ProcessSendable>(num_workers: usize, phenotype_goal
 
 	let mut channels = Vec::new();
 	for i in 0..num_workers {
-		channels.push(Channel::new(
+		channels.push(Channel::new::<Msg<T>>(
 			ChannelEndpoint::Sibling(i),
 			ChannelEndpoint::Sibling((i + 1) % num_workers)
 		));
 	}
-	channels.push(Channel::new(
+	channels.push(Channel::new::<T>(
 		ChannelEndpoint::Sibling(num_workers-1),
 		ChannelEndpoint::Pid(pid())
 	));
@@ -200,14 +215,16 @@ fn run<T: Copy + Phenotype + ProcessSendable>(num_workers: usize, phenotype_goal
 	let (_senders, receivers) = spawn(processes, channels);
 	println!("/spawn");
 
-	let mut result = unsafe{mem::uninitialized()};
-	receivers[0].receive::<T>(&mut result);
+	let receiver: Receiver<T> = receivers.into_iter().next().unwrap().downcast();
+	let result = receiver.recv();
 	result
 }
 
 fn do_ga(num_workers: usize) {
+	// TODO: expand to 128 when serde supports it: https://github.com/serde-rs/serde/issues/631
 	#[derive(Copy)]
-	struct MyPhenotype([u8; 128]);
+	#[derive(Serialize, Deserialize)]
+	struct MyPhenotype([u8; 32]);
 	impl Clone for MyPhenotype {
 		fn clone(&self) -> Self { MyPhenotype(self.0) }
 	}

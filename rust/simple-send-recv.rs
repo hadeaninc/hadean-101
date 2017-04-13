@@ -3,17 +3,20 @@
 #[macro_use]
 extern crate hadean;
 
-use hadean::{Sender, Receiver, Connection, ChannelEndpoint, Channel};
+use hadean::{RawSender, RawReceiver, Sender, Receiver, Connection, ChannelEndpoint, Channel};
 use hadean::{spawn, pid};
 
-use std::mem;
 use std::u64;
 
-fn adder(toadd: &u64, mut senders: Vec<Sender>, mut receivers: Vec<Receiver>, _connections: Vec<Connection>) {
-	let (sender, receiver) = (&mut senders[0], &mut receivers[0]);
+fn adder(toadd: &u64, senders: Vec<RawSender>, receivers: Vec<RawReceiver>, _connections: Vec<Connection>) {
+	let mut senders = senders.into_iter();
+	let mut receivers = receivers.into_iter();
+
+	let receiver: Receiver<u64> = receivers.next().unwrap().downcast();
+	let sender: Sender<u64> = senders.next().unwrap().downcast();
+
 	loop {
-		let mut input: u64 = unsafe { mem::uninitialized() };
-		receiver.receive(&mut input);
+		let input = receiver.recv();
 		if input == u64::MAX {
 			break
 		}
@@ -26,30 +29,28 @@ fn main() {
 	let toadd: u64 = 15;
 	let processes = vec![mkprocess!(adder, toadd)];
 
-	let channels = vec![Channel::new(
+	let channels = vec![Channel::new::<u64>(
 		ChannelEndpoint::Sibling(0),
 		ChannelEndpoint::Pid(pid())
-	), Channel::new(
+	), Channel::new::<u64>(
 		ChannelEndpoint::Pid(pid()),
 		ChannelEndpoint::Sibling(0)
 	)];
 
-	let (mut senders, mut receivers) = spawn(processes, channels);
-	let (sender, receiver) = (&mut senders[0], &mut receivers[0]);
+	let (senders, receivers) = spawn(processes, channels);
+	let mut senders = senders.into_iter();
+	let mut receivers = receivers.into_iter();
 
-	let recv_u64 = || {
-		let mut v: u64 = unsafe { mem::uninitialized() };
-		receiver.receive(&mut v);
-		v
-	};
+	let receiver: Receiver<u64> = receivers.next().unwrap().downcast();
+	let sender: Sender<u64> = senders.next().unwrap().downcast();
 
-	sender.send::<u64>(&1);
-	assert!(recv_u64() == 1 + toadd);
-	sender.send::<u64>(&5);
-	assert!(recv_u64() == 5 + toadd);
-	sender.send::<u64>(&99999);
-	assert!(recv_u64() == 99999 + toadd);
-	sender.send::<u64>(&u64::MAX); // terminate subprocess
+	sender.send(&1);
+	assert!(receiver.recv() == 1 + toadd);
+	sender.send(&5);
+	assert!(receiver.recv() == 5 + toadd);
+	sender.send(&99999);
+	assert!(receiver.recv() == 99999 + toadd);
+	sender.send(&u64::MAX); // terminate subprocess
 
 	println!("All adding successful");
 }
