@@ -8,13 +8,13 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 
+use std::{cmp, env, mem};
+
 use hadean::{RawSender, RawReceiver, Sender, Receiver, Connection, ChannelEndpoint, Channel, ProcessTransfer};
 use hadean::{pid, spawn};
 use hadean_std::pinnedvec::PinnedVec;
 use rand::{SeedableRng, Rng};
 use rand::distributions::IndependentSample;
-
-use std::{cmp, mem, env};
 
 use self::Msg::*;
 
@@ -47,7 +47,7 @@ struct WorkerArgs {
 	migrate_count: usize
 }
 #[derive(Serialize, Deserialize)]
-enum Msg<T: Phenotype + ProcessTransfer> {
+enum Msg<T> {
 	Done(bool),
 	Phenotype(T),
 	Best(f64),
